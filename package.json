@@ -1,6 +1,6 @@
 {
   "name": "pino-http-transport",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "url": "https://github.com/sandrinodimattia/pino-http-transport",
   "description": "A pino transport for sending logs to an HTTP endpoint",
   "main": "./dist/index.js",

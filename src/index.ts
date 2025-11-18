@@ -17,7 +17,7 @@ export interface HttpTransportOptions {
 
   /**
    * Request timeout in milliseconds.
-   * @default 10000
+   * @default 2500
    */
   timeout?: number;
 
@@ -35,7 +35,7 @@ export interface HttpTransportOptions {
 
   /**
    * Maximum number of retry attempts for failed requests.
-   * @default 3
+   * @default 2
    */
   maxRetries?: number;
 
@@ -87,10 +87,10 @@ export default function httpTransport(opts: HttpTransportOptions): ReturnType<ty
   const {
     url,
     headers = {},
-    timeout = 10000,
+    timeout = 2500,
     batchSize = 100,
     batchInterval = 5000,
-    maxRetries = 3,
+    maxRetries = 2,
     retryDelay = 1000,
     silent = false,
     maxBufferSize = 100000, // ~100MB assuming ~1KB per log
