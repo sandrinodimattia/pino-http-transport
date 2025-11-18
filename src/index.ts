@@ -1,5 +1,6 @@
 import build from 'pino-abstract-transport';
 import { backOff } from 'exponential-backoff';
+import { isMainThread } from 'node:worker_threads';
 
 import type { PinoLogObject } from './types/log';
 
@@ -62,18 +63,20 @@ export interface HttpTransportOptions {
 }
 
 /**
- * Handle uncaught exceptions.
+ * Handle uncaught exceptions (only in worker mode).
  */
-process.on('uncaughtException', (error) => {
-  const err = error instanceof Error ? error : new Error(String(error));
-  console.error(`[pino-http-transport] Uncaught exception:`, err.message);
-  process.exit(1);
-});
-process.on('unhandledRejection', (error) => {
-  const err = error instanceof Error ? error : new Error(String(error));
-  console.error(`[pino-http-transport] Unhandled rejection:`, err.message);
-  process.exit(1);
-});
+if (!isMainThread) {
+  process.on('uncaughtException', (error) => {
+    const err = error instanceof Error ? error : new Error(String(error));
+    console.error(`[pino-http-transport] Uncaught exception:`, err.message);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (error) => {
+    const err = error instanceof Error ? error : new Error(String(error));
+    console.error(`[pino-http-transport] Unhandled rejection:`, err.message);
+    process.exit(1);
+  });
+}
 
 /**
  * Create a new HTTP transport for Pino which sends logs to an HTTP endpoint.
