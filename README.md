@@ -62,7 +62,7 @@ interface HttpTransportOptions {
 
 Logs are buffered in memory and sent in batches via HTTP POST. The request body is a JSON array of log objects:
 
-```json
+```bash
 POST /ingest
 Content-Type: application/json
 
