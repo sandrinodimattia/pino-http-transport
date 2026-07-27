@@ -1,80 +1,50 @@
-name: Publish to NPM
+name: Publish
+
+run-name: Publish ${{ github.ref_name }} to npm
 
 on:
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to publish (e.g., 1.0.0)"
-        required: true
-        type: string
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: npm
+    timeout-minutes: 10
     permissions:
-      contents: write
+      contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "23.x"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v2
-        with:
-          version: 10
-
-      - name: Setup pnpm cache
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Install dependencies without lifecycle scripts
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Verify release tag
+        shell: bash
         run: |
-          mkdir -p ~/.pnpm-store
-          echo "STORE_PATH=~/.pnpm-store" >> $GITHUB_ENV
-
-      - uses: actions/cache@v3
-        name: Setup pnpm cache
-        with:
-          path: ~/.pnpm-store
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-pnpm-store-
-
-      - name: Install dependencies
-        run: pnpm install
-
-      - name: Build to run the worker tests
-        run: pnpm build
-
-      - name: Test
-        run: pnpm test
-
-      - name: Build
-        run: pnpm build
-
-      - name: Validate version
-        run: |
-          if ! [[ "${{ github.event.inputs.version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
-            echo "Invalid version format. Please use semantic versioning (e.g., 1.0.0 or 1.0.0-beta.1)"
+          expected_tag="v$(node --print "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            echo "Publishing requires a tag ref; received $GITHUB_REF."
             exit 1
           fi
-
-      - name: Update package version
-        run: |
-          npm version ${{ github.event.inputs.version }} --no-git-tag-version
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-          git add package.json
-          git commit -m "release: ${{ github.event.inputs.version }}"
-          git tag v${{ github.event.inputs.version }}
-          git push origin main --tags
-
-      - name: Publish to NPM
-        shell: bash
-        run: pnpm publish --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          if [[ "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $expected_tag."
+            exit 1
+          fi
+      - name: Build package
+        run: pnpm build
+      - name: Inspect package contents
+        run: npm pack --dry-run --ignore-scripts
+      - name: Publish to npm
+        run: npm publish --provenance --ignore-scripts
