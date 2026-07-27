@@ -2,6 +2,8 @@ packages:
   - "."
   - "examples/*"
 
+minimumReleaseAge: 10080
+
 allowBuilds:
   esbuild: true
 overrides:
