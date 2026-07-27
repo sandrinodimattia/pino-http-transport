@@ -1,17 +1,15 @@
 {
   "name": "pino-http-transport",
   "version": "1.0.0",
-  "url": "https://github.com/sandrinodimattia/pino-http-transport",
-  "description": "A pino transport for sending logs to an HTTP endpoint",
-  "main": "./dist/index.js",
-  "module": "dist/index.mjs",
-  "types": "./dist/index.d.ts",
+  "description": "A reliable Pino transport for sending logs to an HTTP endpoint",
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "default": "./dist/index.js"
     }
   },
   "files": [
@@ -19,43 +17,54 @@
     "README.md",
     "LICENSE"
   ],
+  "sideEffects": false,
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts --sourcemap",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "lint": "biome lint .",
-    "format": "biome format --write .",
-    "prepare": "husky install",
-    "prepublishOnly": "pnpm run build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "biome check . && jsdoc-lint src && pnpm run typecheck",
+    "check:fix": "biome check --write --unsafe . && jsdoc-lint src && pnpm run typecheck",
+    "prepack": "pnpm run build",
+    "prepublishOnly": "pnpm run check && pnpm run test:coverage"
   },
   "keywords": [
-    "pino"
+    "pino",
+    "transport",
+    "logging",
+    "http"
   ],
   "author": "Sandrino Di Mattia",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sandrinodm/pino-http-transport.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sandrinodm/pino-http-transport/issues"
+  },
+  "homepage": "https://github.com/sandrinodm/pino-http-transport#readme",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.0.0"
   },
+  "packageManager": "pnpm@11.17.0",
   "publishConfig": {
-    "access": "public"
-  },
-  "devDependencies": {
-    "@biomejs/biome": "^2.3.6",
-    "@types/node": "^24.10.1",
-    "@vitest/coverage-v8": "^4.0.10",
-    "husky": "^9.1.7",
-    "lint-staged": "^16.2.6",
-    "pino": "^10.1.0",
-    "prettier": "^3.5.3",
-    "ts-node": "^10.9.2",
-    "tsup": "^8.5.1",
-    "typescript": "^5.8.3",
-    "vitest": "^4.0.10"
+    "access": "public",
+    "provenance": true
   },
   "dependencies": {
-    "exponential-backoff": "^3.1.3",
     "pino-abstract-transport": "^3.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.5",
+    "@types/node": "^24.13.3",
+    "@vitest/coverage-v8": "^4.1.10",
+    "jsdoc-lint": "^0.4.0",
+    "pino": "^10.3.1",
+    "release-it": "^20.2.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
   }
 }
