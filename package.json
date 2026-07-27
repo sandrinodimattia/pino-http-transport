@@ -1,6 +1,6 @@
 {
   "name": "pino-http-transport",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "A reliable Pino transport for sending logs to an HTTP endpoint",
   "type": "module",
   "main": "./dist/index.js",
