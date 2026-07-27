@@ -1,313 +1,561 @@
+import { request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import build from 'pino-abstract-transport';
-import { backOff } from 'exponential-backoff';
-import { isMainThread } from 'node:worker_threads';
 
-import type { PinoLogObject } from './types/log';
+/**
+ * A parsed JSON object emitted by Pino's transport stream.
+ */
+type PinoRecord = Record<string, unknown>;
 
+/**
+ * Largest delay accepted by Node's timer implementation.
+ */
+const MAX_TIMER_DELAY = 2_147_483_647;
+
+/**
+ * Configuration for delivering Pino records as JSON batches.
+ */
 export interface HttpTransportOptions {
   /**
-   * The HTTP endpoint URL to send logs to.
+   * HTTP or HTTPS endpoint that receives JSON batches.
    */
   url: string;
 
   /**
-   * Additional HTTP headers to include in requests.
+   * Additional request headers. Content-Type defaults to application/json.
    */
   headers?: Record<string, string>;
 
   /**
-   * Request timeout in milliseconds.
-   * @default 2500
+   * Per-request timeout in milliseconds. @default 2500
    */
   timeout?: number;
 
   /**
-   * Number of logs to batch before sending.
-   * @default 100
+   * Records per request. @default 100
    */
   batchSize?: number;
 
   /**
-   * Maximum interval in milliseconds between batch sends.
-   * @default 5000
+   * Maximum age of a partial batch in milliseconds. @default 5000
    */
   batchInterval?: number;
 
   /**
-   * Maximum number of retry attempts for failed requests.
-   * @default 2
+   * Retries after the first failed request. @default 2
    */
   maxRetries?: number;
 
   /**
-   * Base delay in milliseconds for exponential backoff retries.
-   * @default 1000
+   * Initial retry delay in milliseconds. @default 1000
    */
   retryDelay?: number;
 
   /**
-   * Whether to suppress error logging to console.
-   * When false, errors are logged to stderr (visible in worker threads).
-   * When true, errors are silently ignored.
-   * @default false (errors are logged)
+   * Suppress transport diagnostics without changing failure semantics. @default false
    */
   silent?: boolean;
 
   /**
-   * Maximum number of logs to buffer before dropping old logs.
-   * When the buffer exceeds this count, the oldest logs are dropped to prevent OOM errors.
-   * Estimated at ~1KB per log, so 100000 logs ≈ 100MB.
-   * @default 100000
+   * Maximum queued records waiting behind the active request. @default 100000
    */
   maxBufferSize?: number;
 }
 
 /**
- * Handle uncaught exceptions (only in worker mode).
+ * Fully validated options used by the delivery state machine.
  */
-if (!isMainThread) {
-  process.on('uncaughtException', (error) => {
-    const err = error instanceof Error ? error : new Error(String(error));
-    console.error(`[pino-http-transport] Uncaught exception:`, err.message);
-    process.exit(1);
-  });
-  process.on('unhandledRejection', (error) => {
-    const err = error instanceof Error ? error : new Error(String(error));
-    console.error(`[pino-http-transport] Unhandled rejection:`, err.message);
-    process.exit(1);
-  });
+interface ValidatedOptions {
+  /**
+   * Parsed endpoint used by Node's HTTP client.
+   */
+  endpoint: URL;
+
+  /**
+   * Normalized request headers.
+   */
+  headers: Record<string, string>;
+
+  /**
+   * Timeout applied to every HTTP request.
+   */
+  timeout: number;
+
+  /**
+   * Maximum records in a request batch.
+   */
+  batchSize: number;
+
+  /**
+   * Maximum partial-batch wait time.
+   */
+  batchInterval: number;
+
+  /**
+   * Number of retries after the initial request.
+   */
+  maxRetries: number;
+
+  /**
+   * Initial retry backoff delay.
+   */
+  retryDelay: number;
+
+  /**
+   * Whether diagnostics are suppressed.
+   */
+  silent: boolean;
+
+  /**
+   * Maximum records waiting behind the active request.
+   */
+  maxBufferSize: number;
 }
 
 /**
- * Create a new HTTP transport for Pino which sends logs to an HTTP endpoint.
- * @param opts - The transport options.
- * @returns The transport function.
+ * Sends Pino records to an HTTP endpoint while preserving record order and
+ * making shutdown observable to Pino's worker transport.
  */
-export default function httpTransport(opts: HttpTransportOptions): ReturnType<typeof build> {
-  const {
-    url,
-    headers = {},
-    timeout = 2500,
-    batchSize = 100,
-    batchInterval = 5000,
-    maxRetries = 2,
-    retryDelay = 1000,
-    silent = false,
-    maxBufferSize = 100000, // ~100MB assuming ~1KB per log
-  } = opts;
-
-  const logger = {
-    warn: (message: string) => {
-      if (!silent) {
-        console.warn(`[pino-http-transport] ${message}`);
-      }
-    },
-    error: (message: string, error: Error) => {
-      if (!silent) {
-        console.error(`[pino-http-transport] ${message}:`, error.message);
-      }
-    },
-  };
-
-  // Validate required options
-  if (!url || typeof url !== 'string') {
-    throw new Error('HTTP transport requires a valid URL');
-  }
-
-  let flushing = false;
-  let flushTimer: NodeJS.Timeout | null = null;
-  let droppedLogsCount = 0;
-
-  // In-memory buffer for logs awaiting transmission
-  const buffer: PinoLogObject[] = [];
+export default function httpTransport(options: HttpTransportOptions): ReturnType<typeof build> {
+  const config = validateOptions(options);
+  const buffer = new RecordQueue();
+  let activeDelivery: Promise<void> | undefined;
+  let deliveryError: Error | undefined;
+  let droppedRecords = 0;
+  let flushDue = false;
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  let closing = false;
 
   /**
-   * Send a batch of logs to the HTTP endpoint with retry logic using exponential backoff.
-   * @param logs - Array of log objects to send.
+   * Reports buffer-pressure diagnostics unless explicitly silenced.
    */
-  async function sendBatch(logs: PinoLogObject[]): Promise<void> {
-    if (logs.length === 0) {
-      return;
-    }
-
-    // Pre-serialize to avoid holding log objects in memory during retries
-    const payload = JSON.stringify(logs);
-
-    // Clear the logs array immediately to allow GC of log objects
-    logs.length = 0;
-
-    try {
-      await backOff(
-        async () => {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-          try {
-            const response = await fetch(url, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                ...headers,
-              },
-              body: payload,
-              signal: controller.signal,
-            });
-
-            clearTimeout(timeoutId);
-
-            // If the response is not ok, log an error and throw an error
-            if (!response.ok) {
-              const err = new Error(`HTTP Status Code: ${response.status}, Status Text: ${response.statusText}`);
-              logger.error(`Log delivery failed`, err);
-              throw err;
-            }
-          } catch (error) {
-            clearTimeout(timeoutId);
-            throw error;
-          }
-        },
-        {
-          delayFirstAttempt: false,
-          numOfAttempts: maxRetries + 1,
-          startingDelay: retryDelay,
-          timeMultiple: 2,
-          maxDelay: timeout,
-        }
-      );
-    } catch (error: unknown) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      logger.error(`Failed to send batch after ${maxRetries} retries`, err);
+  function warn(message: string): void {
+    if (!config.silent) {
+      console.warn(`[pino-http-transport] ${message}`);
     }
   }
 
   /**
-   * Flush function to send buffered logs to HTTP endpoint.
+   * Reports terminal delivery failures without altering their propagation.
    */
-  async function flushBuffer(): Promise<void> {
-    // Skip if a flush is already in progress
-    if (flushing) {
-      return;
-    }
-
-    // Skip if there are no logs to flush
-    if (buffer.length === 0) {
-      return;
-    }
-
-    // Set the flushing flag to avoid concurrent flushes
-    flushing = true;
-
-    try {
-      // Limit batch size to prevent huge JSON payloads that cause memory spikes
-      // Under heavy load, buffer can grow large; send in chunks to limit memory usage
-      // Enforce a max batchSize per flush to prevent multi-MB JSON.stringify operations
-      const maxLogsPerFlush = Math.min(buffer.length, batchSize);
-
-      // Use splice to remove items from buffer and get them in one operation
-      // This is more memory-efficient than spreading [...buffer] then clearing
-      const logsToSend = buffer.splice(0, maxLogsPerFlush);
-
-      // Send logs asynchronously
-      await sendBatch(logsToSend);
-
-      // If there are still logs in buffer after this flush, schedule another flush
-      // This prevents buffer from staying full when under sustained high load
-      if (buffer.length > 0) {
-        // Use setImmediate to allow event loop to process other events
-        setImmediate(() => {
-          flushBuffer().catch((e) => {
-            logger.error('Continuation flush failed', e as Error);
-          });
-        });
-      }
-    } catch (e) {
-      logger.error('Flushing logs failed', e as Error);
-    } finally {
-      flushing = false;
+  function reportError(error: Error): void {
+    if (!config.silent) {
+      console.error('[pino-http-transport] Log delivery failed:', error);
     }
   }
 
   /**
-   * Schedule a batch flush if not already scheduled.
+   * Cancels the pending partial-batch timer when immediate work supersedes it.
    */
-  function scheduleBatchFlush(): void {
+  function clearFlushTimer(): void {
     if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = undefined;
+    }
+  }
+
+  /**
+   * Schedules delivery of a partial batch while the transport remains open.
+   */
+  function scheduleFlush(): void {
+    if (flushTimer || buffer.length === 0 || closing) {
       return;
     }
 
     flushTimer = setTimeout(() => {
-      flushTimer = null;
-
-      // Fire and forget - don't await to avoid blocking
-      flushBuffer().catch((e) => {
-        logger.error('Scheduled flush failed', e as Error);
-      });
-    }, batchInterval);
+      flushTimer = undefined;
+      flushDue = true;
+      maybeStartDelivery();
+    }, config.batchInterval);
   }
 
-  // Return the transport function
-  return build(
-    async (source) => {
-      for await (const obj of source) {
-        const log = obj as PinoLogObject;
+  /**
+   * Starts the next batch only when ordering and batching constraints allow it.
+   */
+  function maybeStartDelivery(): void {
+    if (activeDelivery || buffer.length === 0) {
+      return;
+    }
 
-        // FIFO: Drop oldest logs if buffer is at capacity BEFORE adding new log
-        // This ensures new logs are always accepted and old logs are dropped
-        if (buffer.length >= maxBufferSize) {
-          // Drop the oldest log to make room for the new one
-          buffer.shift();
-          droppedLogsCount++;
+    if (!closing && !flushDue && buffer.length < config.batchSize) {
+      scheduleFlush();
+      return;
+    }
 
-          // Warn on first drop and then periodically to avoid log spam
-          if (droppedLogsCount === 1 || droppedLogsCount % 1000 === 0) {
-            logger.warn(
-              `Buffer size limit exceeded (${maxBufferSize}). Dropped ${droppedLogsCount} oldest log(s) to prevent OOM.`
-            );
-          }
+    const records = buffer.take(config.batchSize);
+    if (buffer.length === 0) {
+      clearFlushTimer();
+      flushDue = false;
+    }
+
+    activeDelivery = sendBatch(records)
+      .catch((error: unknown) => {
+        const failure = toError(error);
+        deliveryError ??= failure;
+        reportError(failure);
+      })
+      .finally(() => {
+        activeDelivery = undefined;
+        maybeStartDelivery();
+      });
+  }
+
+  /**
+   * Delivers one batch and retries retryable failures with bounded backoff.
+   */
+  async function sendBatch(records: PinoRecord[]): Promise<void> {
+    const body = JSON.stringify(records);
+
+    for (let attempt = 0; attempt <= config.maxRetries; attempt += 1) {
+      try {
+        await postJson(config.endpoint, config.headers, body, config.timeout);
+
+        return;
+      } catch (error) {
+        if (attempt === config.maxRetries) {
+          throw toError(error);
         }
 
-        // Add the new log to the buffer
-        buffer.push(log);
-
-        // If buffer exceeds the threshold, flush immediately
-        if (buffer.length >= batchSize) {
-          // Cancel any scheduled flush since we're flushing immediately
-          if (flushTimer) {
-            clearTimeout(flushTimer);
-            flushTimer = null;
-          }
-
-          // Fire and forget - don't await to avoid blocking the log stream
-          flushBuffer().catch((e) => {
-            logger.error('Immediate flush failed', e as Error);
-          });
-        } else {
-          // Schedule a flush if not already scheduled
-          scheduleBatchFlush();
-        }
+        const delay = Math.min(config.retryDelay * 2 ** attempt, config.timeout);
+        await wait(delay);
       }
+    }
+  }
+
+  /**
+   * Prevents new timer scheduling and waits for all buffered delivery work.
+   */
+  async function drain(): Promise<void> {
+    closing = true;
+    clearFlushTimer();
+    flushDue = true;
+
+    while (activeDelivery || buffer.length > 0) {
+      maybeStartDelivery();
+      if (activeDelivery) {
+        await activeDelivery;
+      }
+    }
+
+    clearFlushTimer();
+    flushDue = false;
+
+    if (deliveryError) {
+      throw deliveryError;
+    }
+  }
+
+  /**
+   * Adds a record while retaining a bounded queue of waiting records.
+   */
+  function enqueueRecord(record: PinoRecord): void {
+    if (buffer.length >= config.maxBufferSize) {
+      buffer.dropOldest();
+      droppedRecords += 1;
+
+      if (droppedRecords === 1 || droppedRecords % 1000 === 0) {
+        warn(`Buffer limit ${config.maxBufferSize} exceeded; dropped ${droppedRecords} oldest record(s).`);
+      }
+    }
+
+    buffer.enqueue(record);
+
+    if (buffer.length >= config.batchSize) {
+      clearFlushTimer();
+      maybeStartDelivery();
+    } else {
+      scheduleFlush();
+    }
+  }
+
+  return build(
+    (source) => {
+      // A data listener receives every parsed line before stream shutdown starts.
+      // An async iterator can otherwise be cut short by an immediate worker end.
+      source.on('data', (record) => enqueueRecord(record as PinoRecord));
     },
     {
-      close: async (err?: Error) => {
+      /**
+       * Drains delivery work and combines source and delivery failures when both occur.
+       */
+      close: async (sourceError?: Error) => {
+        let deliveryFailure: Error | undefined;
+
         try {
-          // If there was an error, reject the promise
-          if (err) {
-            throw err;
-          }
+          await drain();
+        } catch (error) {
+          deliveryFailure = toError(error);
+        }
 
-          // Clear the flush timer
-          if (flushTimer) {
-            clearTimeout(flushTimer);
-            flushTimer = null;
-          }
+        if (sourceError && deliveryFailure) {
+          throw new AggregateError(
+            [sourceError, deliveryFailure],
+            'Transport source and HTTP delivery failed during close'
+          );
+        }
 
-          // Flush any remaining logs and wait for completion
-          await flushBuffer();
-        } catch (e) {
-          logger.error('Transport close failed', e as Error);
-          throw e;
+        if (sourceError) {
+          throw sourceError;
+        }
+
+        if (deliveryFailure) {
+          throw deliveryFailure;
         }
       },
     }
   );
+}
+
+/**
+ * FIFO record storage that avoids repeated array-front shifts under load.
+ */
+class RecordQueue {
+  /**
+   * Backing storage; consumed entries are cleared until compaction.
+   */
+  private records: Array<PinoRecord | undefined> = [];
+
+  /**
+   * Index of the next record available to consume.
+   */
+  private head = 0;
+
+  /**
+   * Number of records that have not yet been consumed.
+   */
+  get length(): number {
+    return this.records.length - this.head;
+  }
+
+  /**
+   * Appends a record to the tail of the queue.
+   */
+  enqueue(record: PinoRecord): void {
+    this.records.push(record);
+  }
+
+  /**
+   * Discards the oldest waiting record when the configured buffer is full.
+   */
+  dropOldest(): void {
+    if (this.length === 0) {
+      return;
+    }
+
+    this.records[this.head] = undefined;
+    this.head += 1;
+    this.compact();
+  }
+
+  /**
+   * Removes and returns up to the requested number of records in FIFO order.
+   */
+  take(limit: number): PinoRecord[] {
+    const end = Math.min(this.records.length, this.head + limit);
+    const batch: PinoRecord[] = [];
+
+    while (this.head < end) {
+      const record = this.records[this.head];
+      this.records[this.head] = undefined;
+      this.head += 1;
+
+      if (record) {
+        batch.push(record);
+      }
+    }
+
+    this.compact();
+    return batch;
+  }
+
+  /**
+   * Reclaims consumed storage after full depletion or substantial head growth.
+   */
+  private compact(): void {
+    if (this.head === this.records.length) {
+      this.records = [];
+      this.head = 0;
+      return;
+    }
+
+    if (this.head >= 4096 && this.head * 2 >= this.records.length) {
+      this.records = this.records.slice(this.head);
+      this.head = 0;
+    }
+  }
+}
+
+/**
+ * Validates public options and applies the transport's delivery defaults.
+ */
+function validateOptions(input: unknown): ValidatedOptions {
+  if (!isPlainRecord(input)) {
+    throw new Error('HTTP transport options must be a plain object');
+  }
+
+  const url = input.url;
+  if (typeof url !== 'string') {
+    throw new Error('url must be a valid HTTP or HTTPS URL');
+  }
+
+  let endpoint: URL;
+  try {
+    endpoint = new URL(url);
+  } catch {
+    throw new Error('url must be a valid HTTP or HTTPS URL');
+  }
+
+  if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') {
+    throw new Error('url must be a valid HTTP or HTTPS URL');
+  }
+
+  const rawHeaders = input.headers === undefined ? {} : input.headers;
+  if (!isPlainRecord(rawHeaders)) {
+    throw new Error('headers must be a plain record');
+  }
+
+  for (const [name, value] of Object.entries(rawHeaders)) {
+    if (name.trim().length === 0 || typeof value !== 'string') {
+      throw new Error('headers must contain non-empty names and string values');
+    }
+  }
+
+  const normalizedHeaders = new Headers(rawHeaders as Record<string, string>);
+  if (!normalizedHeaders.has('content-type')) {
+    normalizedHeaders.set('content-type', 'application/json');
+  }
+
+  const timeout = input.timeout === undefined ? 2500 : input.timeout;
+  const batchSize = input.batchSize === undefined ? 100 : input.batchSize;
+  const batchInterval = input.batchInterval === undefined ? 5000 : input.batchInterval;
+  const maxRetries = input.maxRetries === undefined ? 2 : input.maxRetries;
+  const retryDelay = input.retryDelay === undefined ? 1000 : input.retryDelay;
+  const silent = input.silent === undefined ? false : input.silent;
+  const maxBufferSize = input.maxBufferSize === undefined ? 100_000 : input.maxBufferSize;
+
+  requireTimer(timeout, 'timeout', 1);
+  requireSafeInteger(batchSize, 'batchSize', 1);
+  requireTimer(batchInterval, 'batchInterval', 1);
+  requireSafeInteger(maxRetries, 'maxRetries', 0);
+  requireTimer(retryDelay, 'retryDelay', 0);
+  requireSafeInteger(maxBufferSize, 'maxBufferSize', 1);
+
+  if (typeof silent !== 'boolean') {
+    throw new Error('silent must be a boolean');
+  }
+
+  return {
+    endpoint,
+    headers: Object.fromEntries(normalizedHeaders.entries()),
+    timeout,
+    batchSize,
+    batchInterval,
+    maxRetries,
+    retryDelay,
+    silent,
+    maxBufferSize,
+  };
+}
+
+/**
+ * Ensures a number can be used safely as a Node timer delay.
+ */
+function requireTimer(value: unknown, name: string, minimum: number): asserts value is number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum || value > MAX_TIMER_DELAY) {
+    throw new Error(`${name} must be a safe integer between ${minimum} and ${MAX_TIMER_DELAY}`);
+  }
+}
+
+/**
+ * Ensures an option is a safe integer at or above its allowed minimum.
+ */
+function requireSafeInteger(value: unknown, name: string, minimum: number): asserts value is number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum) {
+    throw new Error(`${name} must be a safe integer of at least ${minimum}`);
+  }
+}
+
+/**
+ * Narrows unknown values to ordinary object records used for runtime options.
+ */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * Normalizes thrown non-Error values for consistent reporting and propagation.
+ */
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * Sends a JSON body through Node's HTTP client and resolves only for 2xx responses.
+ */
+function postJson(endpoint: URL, headers: Record<string, string>, body: string, timeout: number): Promise<void> {
+  const request = endpoint.protocol === 'https:' ? httpsRequest : httpRequest;
+  const contentLength = Buffer.byteLength(body);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+    /**
+     * Settles the request promise at most once and clears its timeout.
+     */
+    function settle(callback: () => void): void {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      callback();
+    }
+
+    const outgoing = request(
+      endpoint,
+      {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'content-length': String(contentLength),
+        },
+      },
+      (response) => {
+        response.resume();
+        response.once('error', (error) => settle(() => reject(error)));
+        response.once('end', () => {
+          const status = response.statusCode ?? 0;
+          if (status >= 200 && status < 300) {
+            settle(resolve);
+            return;
+          }
+
+          const description = response.statusMessage ? ` ${response.statusMessage}` : '';
+          settle(() => reject(new Error(`HTTP ${status}${description}`)));
+        });
+      }
+    );
+
+    outgoing.once('error', (error) => settle(() => reject(error)));
+    timeoutId = setTimeout(() => {
+      outgoing.destroy(new Error(`HTTP request timed out after ${timeout}ms`));
+    }, timeout);
+    outgoing.end(body);
+  });
+}
+
+/**
+ * Waits for retry backoff without blocking the worker event loop.
+ */
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
