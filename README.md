@@ -10,7 +10,7 @@ Requires Node.js 24 or later.
 ## Install
 
 ```bash
-npm install pino-http-transport
+pnpm add pino-http-transport
 ```
 
 ## Usage
@@ -32,6 +32,55 @@ const logger = pino({
 ```
 
 The endpoint receives an HTTP `POST` with a JSON array of Pino log objects. A response is successful only when it has a 2xx status.
+
+### Received JSON
+
+Each request body is an array containing up to `batchSize` records. Standard Pino fields and any structured fields supplied to the logger are preserved:
+
+```json
+[
+  {
+    "level": 30,
+    "time": 1785182400000,
+    "pid": 4127,
+    "hostname": "api-01",
+    "requestId": "req_01K1ABCDEF",
+    "userId": "user_123",
+    "msg": "Checkout completed"
+  },
+  {
+    "level": 40,
+    "time": 1785182400125,
+    "pid": 4127,
+    "hostname": "api-01",
+    "requestId": "req_01K1ABCDEG",
+    "durationMs": 842,
+    "msg": "Slow request"
+  }
+]
+```
+
+Errors logged with `logger.error({ err }, message)` include Pino's serialized error object:
+
+```json
+[
+  {
+    "level": 50,
+    "time": 1785182400250,
+    "pid": 4127,
+    "hostname": "api-01",
+    "err": {
+      "type": "Error",
+      "message": "Database unavailable",
+      "stack": "Error: Database unavailable\n    at updateOrder (file:///app/orders.js:42:11)"
+    },
+    "orderId": "order_456",
+    "msg": "Could not update order"
+  }
+]
+```
+
+The exact fields depend on your Pino configuration and the structured values passed to each log call.
 
 For direct embedding, import the ESM entry point:
 
@@ -64,6 +113,12 @@ interface HttpTransportOptions {
 
 `url` must use `http:` or `https:`. Numeric options are validated when the transport is created.
 
+## Receiver example
+
+[`examples/hono-server`](./examples/hono-server) contains a runnable [Hono](https://hono.dev/) server that validates incoming batches and prints each record.
+
+Point the transport at `http://localhost:3000/logs`. See the example's README for configuration and a sample request.
+
 ## Delivery and shutdown behavior
 
 - Only one batch is delivered at a time, preserving record order.
@@ -82,7 +137,7 @@ pnpm install --frozen-lockfile
 pnpm check
 ```
 
-`pnpm check` validates formatting, linting, JSDoc, and types. CI additionally runs coverage, the production build, and an npm package dry run.
+`pnpm check` validates formatting, linting, JSDoc, and types. CI additionally runs coverage, the production build, and a package dry run.
 
 ## License
 
